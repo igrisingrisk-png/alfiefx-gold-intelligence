@@ -224,29 +224,71 @@ async def calendar():
 
 @app.get("/api/news")
 async def news():
-    if not FINNHUB:return {"status":"not_configured","message":"Optional FINNHUB_API_KEY enables general market headlines.","items":[]}
-    try:
-        j=await get_json("https://finnhub.io/api/v1/news",{"category":"general","token":FINNHUB})
-        terms=("gold","fed","federal reserve","inflation","treasury","yield","dollar","employment","payroll","cpi","pce","tariff","geopolit","central bank","interest rate","bond yield","nonfarm")
-        current=datetime.now(timezone.utc)
-        out=[]
-        seen=set()
-        for n in j:
-            title=str(n.get("headline","")).strip();summary=str(n.get("summary","")).strip()
-            try:
-                published=datetime.fromtimestamp(int(n["datetime"]),timezone.utc) if n.get("datetime") else None
-            except (TypeError,ValueError,OverflowError):
-                published=None
-            # Do not present stale stories as current; only keep the most recent 48 hours.
-            if published is None or published < current-timedelta(hours=48) or published > current+timedelta(minutes=10):
+    """Fetch fresh gold-relevant context from Finnhub general and forex headlines."""
+    if not FINNHUB:
+        return {"status":"not_configured","message":"Optional FINNHUB_API_KEY enables market headlines.","items":[]}
+    current = datetime.now(timezone.utc)
+    # Two broad categories improve coverage without weakening the 48-hour freshness rule.
+    # If one category fails, keep usable results from the other and report partial status.
+    terms = (
+        "gold", "bullion", "precious metal", "silver", "fed", "federal reserve",
+        "fomc", "interest rate", "rate cut", "rate hike", "monetary policy",
+        "inflation", "treasury", "real yield", "bond yield", "bond market", "dollar",
+        "usd", "employment", "payroll", "nonfarm", "jobless claims", "cpi", "pce",
+        "tariff", "trade war", "geopolit", "central bank", "oil", "crude", "energy prices",
+        "recession", "gdp", "china", "safe haven", "risk aversion", "risk-off", "currency"
+    )
+    out = []
+    seen = set()
+    errors = []
+    for category in ("general", "forex"):
+        try:
+            records = await get_json(
+                "https://finnhub.io/api/v1/news",
+                {"category": category, "token": FINNHUB},
+            )
+            if not isinstance(records, list):
+                errors.append(category + ": provider returned an unexpected response")
                 continue
-            if not title or title.lower() in seen or not any(w in (title+" "+summary).lower() for w in terms):
-                continue
-            seen.add(title.lower())
-            out.append({"headline":title,"summary":summary[:250],"source":n.get("source"),"url":n.get("url"),"published_at":published.isoformat(),"age_hours":round((current-published).total_seconds()/3600,1)})
-        out.sort(key=lambda item:item["published_at"],reverse=True)
-        return {"status":"connected" if out else "connected_no_fresh_headlines","checked_at":now(),"message":"Gold-relevant general market headlines published within the last 48 hours only. Headlines are context, not verified directional signals.","items":out[:8]}
-    except Exception as e:return {"status":"error","message":str(e)[:200],"items":[]}
+            for n in records:
+                if not isinstance(n, dict):
+                    continue
+                title = str(n.get("headline", "")).strip()
+                summary = str(n.get("summary", "")).strip()
+                try:
+                    published = datetime.fromtimestamp(int(n["datetime"]), timezone.utc) if n.get("datetime") else None
+                except (TypeError, ValueError, OverflowError):
+                    published = None
+                # Never present stale stories as current; retain only the most recent 48 hours.
+                if published is None or published < current - timedelta(hours=48) or published > current + timedelta(minutes=10):
+                    continue
+                combined = (title + " " + summary).lower()
+                key = (title.lower(), str(n.get("url") or ""))
+                if not title or key in seen or not any(term in combined for term in terms):
+                    continue
+                seen.add(key)
+                out.append({
+                    "headline": title,
+                    "summary": summary[:250],
+                    "source": n.get("source"),
+                    "url": n.get("url"),
+                    "category": category,
+                    "published_at": published.isoformat(),
+                    "age_hours": round((current - published).total_seconds() / 3600, 1),
+                })
+        except Exception as e:
+            errors.append(category + ": " + str(e)[:120])
+    out.sort(key=lambda item: item["published_at"], reverse=True)
+    status = "connected" if out and not errors else "partial" if out else "error" if errors else "connected_no_fresh_headlines"
+    if out:
+        message = f"{len(out)} gold-relevant headlines from general and forex news, published within the last 48 hours. Headlines are context, not verified directional signals."
+        if errors:
+            message += " Some provider categories were unavailable."
+    elif errors:
+        message = "News provider could not return usable headlines. Try refreshing later."
+    else:
+        message = "No gold-relevant headlines were published in the last 48 hours. This is preferable to showing stale stories as current."
+    return {"status": status, "checked_at": now(), "message": message, "items": out[:8], "errors": errors}
 
 @app.post("/api/markets/{market}/candles/import-csv")
 async def import_csv(market:Market,file:UploadFile=File(...)):
@@ -293,6 +335,6 @@ async function signal(){try{let s=await api('/api/signals/'+$('market').value);$
 async function loadCandles(){try{let d=await api('/api/markets/'+$('market').value+'/candles?interval=5min&limit=120');lastCandles=d.candles||[];drawChart('priceChart',lastCandles);drawChart('technicalChart',lastCandles);$('chartStatus').textContent=d.is_live_data?'Provider candles · '+datefmt(d.candles.at(-1)?.timestamp):'Not live';}catch(e){lastCandles=[];drawChart('priceChart',[]);drawChart('technicalChart',[]);$('chartStatus').textContent='No candles';}}
 async function loadMacro(){try{let x=await api('/api/macro');$('mbias').textContent=x.bias||x.status;$('macroShort').textContent=x.bias||x.status;$('macroCard').textContent=x.message||x.status;$('mmsg').textContent=x.message||'';$('mstatus').textContent=x.status||'Unknown';$('mi').replaceChildren();$('usdValue').textContent='—';$('yieldValue').textContent='—';(x.items||[]).forEach(i=>{let d=document.createElement('div');d.className='row';d.textContent=i.label+': '+fmt(i.value)+' · date '+(i.date||'—')+' · change '+fmt(i.change);$('mi').appendChild(d);if(i.series_id==='DTWEXBGS'){$('usdValue').textContent=fmt(i.value);$('usdDate').textContent='Observation date '+(i.date||'—')}if(i.series_id==='DFII10'){$('yieldValue').textContent=fmt(i.value)+'%';$('yieldDate').textContent='Observation date '+(i.date||'—')}});if(!x.items?.length)$('mi').innerHTML='<div class="list-empty">No macro observations available. Configure FRED_API_KEY to enable daily context.</div>'}catch(e){$('mmsg').textContent=e.message;$('macroCard').textContent='Macro feed unavailable';$('macroShort').textContent='Unavailable'}}
 async function loadNews(){try{let x=await api('/api/news');$('nmsg').textContent=x.message||x.status;$('ni').replaceChildren();$('newsCard').textContent=x.items?.length?x.items[0].headline:(x.message||'No fresh headlines available');(x.items||[]).forEach(i=>{let d=document.createElement('div');d.className='news-item';let a=document.createElement('a');a.href=i.url||'#';a.target='_blank';a.rel='noopener noreferrer';a.textContent=i.headline||'Untitled headline';d.appendChild(a);let p=document.createElement('div');p.className='news-meta';let published='time unavailable';if(i.published_at){let dt=new Date(i.published_at);if(!Number.isNaN(dt.getTime()))published=dt.toLocaleString('en-GB',{timeZone:'Europe/London',day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit',hour12:false})+' UK'}p.textContent=(i.source||'Source unavailable')+' - '+published+(i.age_hours!=null?' - '+i.age_hours+'h ago':'');d.appendChild(p);if(i.summary){let s=document.createElement('p');s.className='muted';s.textContent=i.summary;d.appendChild(s)}$('ni').appendChild(d)});if(!x.items?.length)$('ni').innerHTML='<div class="list-empty">No gold-relevant headlines published in the last 48 hours. This is preferable to showing stale stories as current.</div>'}catch(e){$('nmsg').textContent=e.message;$('newsCard').textContent='News feed unavailable'}}
-async function loadCalendar(){try{let x=await api('/api/calendar');$('calmsg').textContent=x.message||x.status;$('calendarItems').replaceChildren();if(x.status==='error'){$('calendarItems').innerHTML='<div class="notice bad">Calendar feed unavailable. Try refreshing later.</div>';return}if(!x.items?.length){$('calendarItems').innerHTML='<div class="list-empty">No upcoming medium/high-impact economic events were returned for the selected window.</div>';return}(x.items||[]).forEach(i=>{let d=document.createElement('div');d.className='news-item';let title=document.createElement('b');title.textContent=i.title||'Economic event';d.appendChild(title);let meta=document.createElement('div');meta.className='news-meta';let bits=[i.time_uk||i.date||'Time not supplied'];if(i.currency)bits.push(i.currency);if(i.impact)bits.push('Impact: '+i.impact);meta.textContent=bits.join(' - ');d.appendChild(meta);let details=[];if(i.forecast!=null&&i.forecast!=='')details.push('Forecast: '+i.forecast);if(i.previous!=null&&i.previous!=='')details.push('Previous: '+i.previous);if(i.actual!=null&&i.actual!=='')details.push('Actual: '+i.actual);if(details.length){let p=document.createElement('p');p.className='muted';p.textContent=details.join(' - ');d.appendChild(p)}if(i.url){let a=document.createElement('a');a.href=i.url;a.target='_blank';a.rel='noopener noreferrer';a.textContent='Open source event';d.appendChild(a)}$('calendarItems').appendChild(d)})}catch(e){$('calmsg').textContent='Calendar request failed: '+e.message;$('calendarItems').innerHTML='<div class="notice bad">Calendar feed unavailable. Try refreshing later.</div>'}}async function refreshAll(){try{await status()}catch(e){$('notice').className='notice bad';$('notice').textContent='Status check failed: '+e.message}try{await signal()}catch(e){}await Promise.all([loadMacro(),loadNews(),loadCalendar(),loadCandles()]);} $('market').addEventListener('change',refreshAll);window.addEventListener('resize',()=>{drawChart('priceChart',lastCandles);drawChart('technicalChart',lastCandles)});refreshAll();setInterval(refreshAll,60000);
+async function loadCalendar(){try{let x=await api('/api/calendar');$('calmsg').textContent=x.message||x.status;$('calendarItems').replaceChildren();if(x.status==='error'){$('calendarItems').innerHTML='<div class="notice bad">Calendar feed unavailable. Try refreshing later.</div>';return}if(!x.items?.length){$('calendarItems').innerHTML='<div class="list-empty">No upcoming medium/high-impact economic events were returned for the selected window.</div>';return}(x.items||[]).forEach(i=>{let d=document.createElement('div');d.className='news-item';let title=document.createElement('b');title.textContent=i.title||'Economic event';d.appendChild(title);let meta=document.createElement('div');meta.className='news-meta';let bits=[i.time_uk||i.date||'Time not supplied'];if(i.currency)bits.push(i.currency);if(i.impact)bits.push('Impact: '+i.impact);meta.textContent=bits.join(' - ');d.appendChild(meta);let details=[];if(i.forecast!=null&&i.forecast!=='')details.push('Forecast: '+i.forecast);if(i.previous!=null&&i.previous!=='')details.push('Previous: '+i.previous);if(i.actual!=null&&i.actual!=='')details.push('Actual: '+i.actual);if(details.length){let p=document.createElement('p');p.className='muted';p.textContent=details.join(' - ');d.appendChild(p)}if(i.url){let a=document.createElement('a');a.href=i.url;a.target='_blank';a.rel='noopener noreferrer';a.textContent='View event source';d.appendChild(a)}$('calendarItems').appendChild(d)})}catch(e){$('calmsg').textContent='Calendar request failed: '+e.message;$('calendarItems').innerHTML='<div class="notice bad">Calendar feed unavailable. Try refreshing later.</div>'}}async function refreshAll(){try{await status()}catch(e){$('notice').className='notice bad';$('notice').textContent='Status check failed: '+e.message}try{await signal()}catch(e){}await Promise.all([loadMacro(),loadNews(),loadCalendar(),loadCandles()]);} $('market').addEventListener('change',refreshAll);window.addEventListener('resize',()=>{drawChart('priceChart',lastCandles);drawChart('technicalChart',lastCandles)});refreshAll();setInterval(refreshAll,60000);
 </script></body></html>"""
-
+he
